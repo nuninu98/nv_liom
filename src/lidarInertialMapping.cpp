@@ -991,9 +991,64 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
     mapPublish = false;
     mtx.unlock();
 
-    if(publishMapThread.joinable()) {
-        publishMapThread.join();
+  
+
+    nodesMap = PointNodes;
+
+    mapPoints.reset(new pcl::PointCloud<PointsWithNormals>());
+    mapPoints_rgb.reset(new pcl::PointCloud<pcl::PointXYZRGB>());
+
+    pcl::PointCloud<PointsWithNormals>::Ptr transformedPoints(new pcl::PointCloud<PointsWithNormals>());
+    for(int i = 0; i < nodesMap.size(); i+=vis_node_skip) {
+        Eigen::Matrix4d poseT = nodesMap[i].lidar_pose.matrix();
+        if(mapping_in_rgb == 1) {
+            pcl::transformPointCloudWithNormals(*nodesMap[i].normalPoints, *transformedPoints, poseT);
+        } else {
+            pcl::transformPointCloud(*nodesMap[i].totalPoints, *transformedPoints, poseT);
+        }
+
+        mapPoints->insert(mapPoints->end(), transformedPoints->begin(), transformedPoints->end());
     }
+
+    if(mapping_in_rgb == 1) {
+        for(int i = 0; i < mapPoints->size(); ++i) {
+            pcl::PointXYZRGB pt;
+            pt.x = mapPoints->points[i].x;
+            pt.y = mapPoints->points[i].y;
+            pt.z = mapPoints->points[i].z;
+            pt.r = uint8_t(255.0 * (mapPoints->points[i].normal_x*0.5+0.5));
+            pt.g = uint8_t(255.0 * (mapPoints->points[i].normal_y*0.5+0.5));
+            pt.b = uint8_t(255.0 * (mapPoints->points[i].normal_z*0.5+0.5));
+            mapPoints_rgb->push_back(pt);
+        }
+        
+        if(vis_voxel_size > 0.1) {
+            voxelGridFilterVis_rgb.setInputCloud(mapPoints_rgb);
+            voxelGridFilterVis_rgb.filter(*mapPoints_rgb);
+        }
+
+
+        sensor_msgs::PointCloud2 temp_cloud;
+        pcl::toROSMsg(*mapPoints_rgb, temp_cloud);
+        temp_cloud.header.stamp = ros::Time::now();
+        temp_cloud.header.frame_id = "map";
+        pubCloud.publish(temp_cloud);
+    } else {
+        if(vis_voxel_size > 0.1) {
+            voxelGridFilterVis.setInputCloud(mapPoints);
+            voxelGridFilterVis.filter(*mapPoints);
+        }
+
+        sensor_msgs::PointCloud2 temp_cloud;
+        pcl::toROSMsg(*mapPoints, temp_cloud);
+        temp_cloud.header.stamp = ros::Time::now();
+        temp_cloud.header.frame_id = "map";
+        pubCloud.publish(temp_cloud);
+    }
+    pcl::io::savePCDFileASCII (map_save_dir + "/GlobalMap.pcd", *mapPoints);
+    // if(publishMapThread.joinable()) {
+    //     publishMapThread.join();
+    // }
 
     if(PointNodes.empty()) {
         printf("No Data To Save\n");
@@ -1011,7 +1066,6 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
         FILE * keyframe_pose_file = fopen(keyframe_pose_save_path.c_str(), "w");
         FILE * lidar_pose_file = fopen(lidar_pose_save_path.c_str(), "w");
         FILE * keytonode_file = fopen(keyframe_no_to_node_no_path.c_str(), "w");
-
         for(int i = 0; i < PointNodes.size(); ++i) {
             if(!PointNodes[i].is_stable) {
                 continue;
@@ -1023,24 +1077,24 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
                     PointNodes[i].pose.x(),
                     PointNodes[i].pose.y(),
                     PointNodes[i].pose.z(),
+                    PointNodes[i].pose.rotation().toQuaternion().w(),
                     PointNodes[i].pose.rotation().toQuaternion().x(),
                     PointNodes[i].pose.rotation().toQuaternion().y(),
-                    PointNodes[i].pose.rotation().toQuaternion().z(),
-                    PointNodes[i].pose.rotation().toQuaternion().w());
+                    PointNodes[i].pose.rotation().toQuaternion().z());
+                    std::cout<<keyframe_pose_file<<std::endl;
             fwrite(pose, 1, strlen(pose), keyframe_pose_file);
-
+            
             char lidar_pose[10000];
             sprintf(lidar_pose, "%06d\t%.09f\t%.09f\t%.09f\t%.09f\t%.09f\t%.09f\t%.09f\n",
                     i,
                     PointNodes[i].lidar_pose.x(),
                     PointNodes[i].lidar_pose.y(),
                     PointNodes[i].lidar_pose.z(),
+                    PointNodes[i].lidar_pose.rotation().toQuaternion().w(),
                     PointNodes[i].lidar_pose.rotation().toQuaternion().x(),
                     PointNodes[i].lidar_pose.rotation().toQuaternion().y(),
-                    PointNodes[i].lidar_pose.rotation().toQuaternion().z(),
-                    PointNodes[i].lidar_pose.rotation().toQuaternion().w());
+                    PointNodes[i].lidar_pose.rotation().toQuaternion().z());
             fwrite(lidar_pose, 1, strlen(lidar_pose), lidar_pose_file);
-
 
             OnSaveNormalPointCloud(i, PointNodes[i]);
             OnSavePointCloud(i, PointNodes[i]);
@@ -1056,9 +1110,8 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
         FILE * pose_file = fopen(pose_save_path.c_str(), "w");
 
         char pose_header[10000];
-        sprintf(pose_header, "# timestamp_s tx ty tz qx qy qz qw\n");
+        sprintf(pose_header, "# timestamp_s tx ty tz qw qx qy qz\n");
         fwrite(pose_header, 1, strlen(pose_header), pose_file);
-        
         for(int i = 0; i < nodeTimePairs.size(); ++i) {
             gtsam::Pose3 curr_pose = result.at<gtsam::Pose3>(X(nodeTimePairs[i].second));
             double time = nodeTimePairs[i].first;
@@ -1070,20 +1123,20 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
                                     curr_pose.x(),
                                     curr_pose.y(),
                                     curr_pose.z(),
+                                    curr_pose.rotation().toQuaternion().w(),
                                     curr_pose.rotation().toQuaternion().x(),
                                     curr_pose.rotation().toQuaternion().y(),
-                                    curr_pose.rotation().toQuaternion().z(),
-                                    curr_pose.rotation().toQuaternion().w());
+                                    curr_pose.rotation().toQuaternion().z());
             } else {
                 sprintf(pose, "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f\n",
                                     time,
                                     curr_pose.x(),
                                     curr_pose.y(),
                                     curr_pose.z(),
+                                    curr_pose.rotation().toQuaternion().w(),
                                     curr_pose.rotation().toQuaternion().x(),
                                     curr_pose.rotation().toQuaternion().y(),
-                                    curr_pose.rotation().toQuaternion().z(),
-                                    curr_pose.rotation().toQuaternion().w());
+                                    curr_pose.rotation().toQuaternion().z());
             }
 
             fwrite(pose, 1, strlen(pose), pose_file);
@@ -1091,7 +1144,6 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
         fclose(pose_file);
 
         FILE * loop_file = fopen(loop_index_save_path.c_str(), "w");
-
         for(int i = 0; i < loopEdges.size(); ++i) {
             int key_pre = loopEdges[i].first;
             int key_cur = loopEdges[i].second;
@@ -1121,7 +1173,6 @@ void OnReceiveEndMappingMessage(const std_msgs::BoolConstPtr & msg) {
             fwrite(loop_corr, 1, strlen(loop_corr), loop_file);
         }
         fclose(loop_file);
-
         //Save Graph
         printf("Saving Graph...\n");
         if(GTSAM_VERSION_MAJOR == 4 && GTSAM_VERSION_MINOR >= 2) {
